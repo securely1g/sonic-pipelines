@@ -48,6 +48,10 @@ steps:
         echo "# $repo" | tee -a $cur_dir/log
         branches=$(cat ../azure-pipelines/codesync.json | jq -r keys[])
         for branch in $branches; do
+          if [[ ",${SKIP_BRANCHES//[[:space:]]/}," == *",$branch,"* ]]; then
+            echo "======Skipping code sync for $branch======"
+            continue
+          fi
           branch_repos=$(cat ../azure-pipelines/codesync.json | jq -r ".\"$branch\"")
           [ -z "$branch_repos" ] && continue
           if echo "$branch_repos" | grep -v $repo; then
@@ -132,7 +136,9 @@ steps:
               --arg repo "$repo_name" \
               --arg branch "$branch_base" \
               --arg commit "$head_commit" \
-              '{repo: $repo, branch: $branch, commit: $commit}' >> $cur_dir/conflicts.jsonl
+              --arg upstream_repo "sonic-net/$repo" \
+              --arg upstream_branch "$branch_head" \
+              '{repo: $repo, branch: $branch, commit: $commit, upstream_repo: $upstream_repo, upstream_branch: $upstream_branch}' >> $cur_dir/conflicts.jsonl
             git merge --abort
             continue
           fi
@@ -163,7 +169,10 @@ steps:
             exit 1
           fi
           if echo "$url_" | grep -q "already exists:"; then
-            gh pr edit $url -b "$body" --add-label automerge
+            pr_number=${url##*/}
+            gh api --method PATCH repos/Azure/$repo.msft/pulls/$pr_number -f body="$body"
+            jq -cn '{labels: ["automerge"]}' |
+              gh api --method POST repos/Azure/$repo.msft/issues/$pr_number/labels --input - --silent
           fi
           echo "  - $url" >> $cur_dir/log
           sleep 10

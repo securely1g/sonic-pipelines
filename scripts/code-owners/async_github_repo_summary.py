@@ -27,6 +27,14 @@ from organization import (
 logger = logging.getLogger(__name__)
 
 
+class GitHubAPIError(ValueError):
+    """GitHub request failure with its HTTP status preserved."""
+
+    def __init__(self, status: int, message: str):
+        super().__init__(message)
+        self.status = status
+
+
 class AsyncGitHubRepoSummary:
     """Asynchronous GitHub repository analyzer for code ownership generation.
 
@@ -161,7 +169,8 @@ class AsyncGitHubRepoSummary:
                         if response.status == 403 or response.status == 429:
                             continue
                         if response.status != 200:
-                            raise ValueError(
+                            raise GitHubAPIError(
+                                response.status,
                                 f"Bad API response: {response} "
                                 f"for {url} {params}"
                             )
@@ -176,7 +185,7 @@ class AsyncGitHubRepoSummary:
 
         Returns:
             Dict[str, Any]: Dictionary containing user information with keys:
-                login, id, name, email, company.
+                login, id, name, email, company, or an empty dict for HTTP 404.
         """
         if github_id == -1:
             return {
@@ -190,10 +199,20 @@ class AsyncGitHubRepoSummary:
             return self.gh_id_lookup_cache[github_id]
         except KeyError:
             pass
-        response = await self.send_github_api_request(
-            f"{AsyncGitHubRepoSummary.GITHUB_API_ENDPOINT}"
-            f"user/{int(github_id)}",
-        )
+        try:
+            response = await self.send_github_api_request(
+                f"{AsyncGitHubRepoSummary.GITHUB_API_ENDPOINT}"
+                f"user/{int(github_id)}",
+            )
+        except GitHubAPIError as error:
+            if error.status != 404:
+                raise
+            logger.warning(
+                "GitHub user ID %s was not found; treating as unresolved",
+                github_id,
+            )
+            self.gh_id_lookup_cache[github_id] = {}
+            return {}
         self.gh_id_lookup_cache[github_id] = result = {
             k: response[k] for k in ["login", "id", "name", "email", "company"]
         }
@@ -207,16 +226,26 @@ class AsyncGitHubRepoSummary:
 
         Returns:
             Dict[str, Any]: Dictionary containing user information with keys:
-                login, id, name, email, company.
+                login, id, name, email, company, or an empty dict for HTTP 404.
         """
         try:
             return self.gh_login_lookup_cache[github_login]
         except KeyError:
             pass
-        response = await self.send_github_api_request(
-            f"{AsyncGitHubRepoSummary.GITHUB_API_ENDPOINT}"
-            f"users/{quote_plus(github_login)}",
-        )
+        try:
+            response = await self.send_github_api_request(
+                f"{AsyncGitHubRepoSummary.GITHUB_API_ENDPOINT}"
+                f"users/{quote_plus(github_login)}",
+            )
+        except GitHubAPIError as error:
+            if error.status != 404:
+                raise
+            logger.warning(
+                "GitHub login %s was not found; treating as unresolved",
+                github_login,
+            )
+            self.gh_login_lookup_cache[github_login] = {}
+            return {}
         self.gh_login_lookup_cache[github_login] = result = {
             k: response[k] for k in ["login", "id", "name", "email", "company"]
         }
@@ -283,6 +312,7 @@ class AsyncGitHubRepoSummary:
         repo: str,
         active_after: datetime,
         max_owners: int,
+        half_life_days: float = 0,
     ):
         """Initialize the repository analysis with configuration parameters.
 
@@ -295,6 +325,8 @@ class AsyncGitHubRepoSummary:
             repo: GitHub repository name.
             active_after: Cutoff date for considering contributors active.
             max_owners: Maximum number of owners per folder.
+            half_life_days: Half-life in days of the recency decay applied
+                to each commit's changes. 0 disables the decay.
         """
         self.contributors = contributors
         self.repo_folders = repo_folders
@@ -312,6 +344,8 @@ class AsyncGitHubRepoSummary:
         self.repo = repo
         self.active_after = active_after
         self.max_owners = max_owners
+        self.half_life_days = half_life_days
+        self.now = datetime.now(timezone.utc)
 
         self.resolved_commit_queue = asyncio.Queue()
         self.to_resolve_commit_queue = asyncio.Queue(
@@ -334,6 +368,7 @@ class AsyncGitHubRepoSummary:
         repo_name: str,
         active_after: datetime,
         max_owners: int,
+        half_life_days: float = 0,
     ):
         """Process a repository to determine code ownership.
 
@@ -352,6 +387,8 @@ class AsyncGitHubRepoSummary:
             repo_name: GitHub repository name.
             active_after: Cutoff date for considering contributors active.
             max_owners: Maximum number of owners per folder.
+            half_life_days: Half-life in days of the recency decay applied
+                to each commit's changes. 0 disables the decay.
         """
         await self._initialize(
             contributors,
@@ -361,6 +398,7 @@ class AsyncGitHubRepoSummary:
             repo_name,
             active_after,
             max_owners,
+            half_life_days,
         )
         cnt = 0
         backlog_workers = [
@@ -408,7 +446,9 @@ class AsyncGitHubRepoSummary:
                 # the cutoff date, add the commit stats to the
                 # repo folders
                 for commit in contributor.commits:
+                    decay = self._recency_factor(commit.ts)
                     for folder, change_count in commit.changes.items():
+                        change_count *= decay
                         folder = os.sep + folder
                         # Apply the changes from the folder up
                         while True:
@@ -461,7 +501,7 @@ class AsyncGitHubRepoSummary:
                     contributor, previous_contributor_changes = next(
                         it_contributors
                     )
-                    folder_settings.owners[contributor.github_login] = (
+                    folder_settings.owners[contributor.github_login] = round(
                         previous_contributor_changes
                     )
                     for contributor, contributor_changes in it_contributors:
@@ -473,9 +513,16 @@ class AsyncGitHubRepoSummary:
                             # if found enough contributors and the new contributor has less changes, stop
                             break
                         folder_settings.owners[contributor.github_login] = (
-                            contributor_changes
+                            round(contributor_changes)
                         )
                         previous_contributor_changes = contributor_changes
+
+    def _recency_factor(self, commit_ts: datetime) -> float:
+        """Weight of a commit: 0.5 ** (age / half_life), or 1 if disabled."""
+        if self.half_life_days <= 0:
+            return 1.0
+        age_days = max(0.0, (self.now - commit_ts).total_seconds() / 86400)
+        return 0.5 ** (age_days / self.half_life_days)
 
     async def resolve_commit(self):
         """Worker task to resolve commit information and update contributors.
@@ -528,7 +575,7 @@ class AsyncGitHubRepoSummary:
                 f"{commit.email}, unable to determine authors' GitHub id. "
                 "Adding to the bundled contributor with GitHub id = -1"
             )
-            github_info = await self.github_id_lookup(author_id)
+            github_info = await self.github_id_lookup(-1)
 
         emails = {commit.email.lower()}
         if github_info["email"]:
@@ -565,15 +612,16 @@ class AsyncGitHubRepoSummary:
             Dict[str, Any]: Dictionary containing GitHub user information, or
             empty dict if not found.
         """
-        local_part, domain = email.split("@")
+        local_part, separator, domain = email.partition("@")
+        if not separator or not local_part or not domain or "@" in domain:
+            logger.warning(
+                "Invalid commit author email %r; unable to resolve GitHub user",
+                email,
+            )
+            return {}
         if domain == "users.noreply.github.com":
-            try:
-                id_str, github_login = local_part.split("+")
+            id_str, separator, github_login = local_part.partition("+")
+            if separator and id_str.isdecimal():
                 return await self.github_id_lookup(int(id_str))
-            except ValueError:
-                # Try using the entire local part as login
-                try:
-                    return await self.github_login_lookup(local_part)
-                except ValueError:
-                    pass
+            return await self.github_login_lookup(local_part)
         return {}

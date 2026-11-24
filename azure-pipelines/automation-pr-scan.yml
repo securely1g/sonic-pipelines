@@ -6,6 +6,10 @@ parameters:
   type: string
   default: 'sonic-net/sonic-buildimage sonic-net/sonic-mgmt sonic-net/sonic-utilities sonic-net/sonic-swss sonic-net/sonic-sairedis sonic-net/sonic-swss-common sonic-net/sonic-dbsyncd sonic-net/sonic-gnmi sonic-net/sonic-host-services sonic-net/sonic-linkmgrd sonic-net/sonic-linux-kernel sonic-net/sonic-mgmt-common sonic-net/sonic-mgmt-framework sonic-net/sonic-platform-common sonic-net/sonic-platform-daemons sonic-net/sonic-py-swsssdk sonic-net/sonic-restapi sonic-net/sonic-snmpagent sonic-net/sonic-wpa-supplicant sonic-net/sonic-dhcp-relay sonic-net/sonic-dhcpmon sonic-net/sonic-dash-api sonic-net/sonic-dash-ha sonic-net/sonic-bmp sonic-net/sonic-ztp Azure/sonic-swss.msft Azure/sonic-sairedis.msft Azure/sonic-utilities.msft Azure/sonic-platform-daemons.msft Azure/sonic-platform-common.msft Azure/sonic-linux-kernel.msft Azure/SAI.msft Azure/sonic-buildimage-msft Azure/sonic-mgmt.msft Azure/sonic-swss-common.msft Azure/sonic-host-services.msft Azure/sonic-gnmi.msft Azure/sonic-dash-api.msft Azure/sonic-dash-ha.msft'
 
+variables:
+- name: excludedAdminMentions
+  value: '["kperumalbfn", "lihuay", "thelinuxfoundation", "wangxin", "xumia"]'
+
 schedules:
 - cron: "11 * * * *"
   branches:
@@ -41,6 +45,7 @@ jobs:
         # more than 3 days, retry the failed jobs
         # failed after retry, comment release branch owner and original PR author to check
         date_3d_ago=$(date --date "3 day ago" -u +"%FT%TZ")
+        date_3h_ago=$(date --date "3 hours ago" -u +"%FT%TZ")
         date_15d_ago=$(date --date "15 day ago" -u +"%FT%TZ")
         date_1m_ago_q=$(date --date "1 month ago" -u +"%Y-%m-%d")
         date_now=$(date -u +"%T")
@@ -53,30 +58,331 @@ jobs:
           local full_body=$(printf "%s\n\n%s" "$comment_body" "$comment_watermark")
           gh pr comment "$pr_url" --body "$full_body"
         }
-        repos="${{ parameters.repos }}"
-        release_owners=$(cat azure-pipelines/release-owners_github_account.json)
+        comment_pr_if_new() {
+          local pr_json=$1
+          local pr_url=$2
+          local message=$3
+          local dedup_message=${4:-$message}
+          if ! echo "$pr_json" | jq -e --arg message "$dedup_message" --arg normalize_mentions "${4:+true}" '
+            .comments[]? | select(.author.login == "mssonicbld"
+              and ((.body // "")
+                | if $normalize_mentions == "true" then gsub(", @[A-Za-z0-9_-]+"; "") else . end
+                | startswith($message)))
+          ' > /dev/null; then
+            comment_pr "$pr_url" "$message"
+          fi
+        }
+        # Renovate PRs merge without a reviewer, so their checks are evaluated strictly. gh pr merge
+        # --admin can bypass the base branch's required checks, so they are evaluated here too.
+        # Prints true only when every check has completed successfully, every required check of the
+        # base branch is present, and a SONiC build check is present. An empty list, a check still
+        # running, timed out or needing action, and a commit status other than success all print
+        # false. Only a check named OPTIONAL is skipped; vulnerability scan is evaluated.
+        renovate_checks_pass() {
+          jq -r --argjson required "$2" '
+            [ (. // [])[] | select((.name // .context // "") | test("OPTIONAL"; "i") | not) ] as $c
+            | [ $c[] | .name // .context ] as $names
+            | ($c | length > 0)
+              and ($c | all(
+                if .__typename == "StatusContext" then .state == "SUCCESS"
+                else .status == "COMPLETED" and (.conclusion | IN("SUCCESS", "NEUTRAL", "SKIPPED")) end))
+              and ($required | all(. as $r | $names | index([$r]) != null))
+              and ($names | any(test("^(Azure|sonic-net)\\.sonic")))
+          ' <<< "$1" || echo false
+        }
+        # A fixup workflow commits as github-actions[bot], whose pull_request runs wait
+        # for approval: the repository requires it for an outside contributor, and an app cannot be
+        # made a collaborator. Branch protection counts only runs a pull request event started, so
+        # those runs have to run. Approves each one waiting on the head commit of this PR's own
+        # branch, or reruns it when GitHub refuses the approval, which starts it as mssonicbld.
+        # Called only once every commit on the PR has passed renovate_commits_pass, so no code a
+        # person pushed is run. Each action is logged with its result. Prints true when it approved
+        # or reran any run: the checks were read before, so the PR merges on a later scan.
+        renovate_approve_runs() {
+          local id out acted=false
+          for id in $(gh api "repos/$1/actions/runs?head_sha=$2&status=action_required&per_page=100" |
+              jq -r --arg repo "$1" --arg branch "$3" --argjson number "${4##*/}" '.workflow_runs[]
+                | select(.event == "pull_request" and .head_branch == $branch
+                    and .head_repository.full_name == $repo and any(.pull_requests[]; .number == $number))
+                | .id'); do
+            acted=true
+            if out=$(gh api -X POST "repos/$1/actions/runs/$id/approve" 2>&1); then
+              echo "    $4: approved workflow run $id" >> skip_prs.log
+            elif out=$(gh api -X POST "repos/$1/actions/runs/$id/rerun" 2>&1); then
+              echo "    $4: reran workflow run $id" >> skip_prs.log
+            else
+              echo "    $4: failed to approve or rerun workflow run $id: $out" >> failure_prs.log
+            fi
+          done
+          echo $acted
+        }
+        # Anyone with write access can push to a Renovate branch, and a pushed commit can name any author.
+        # Prints true only when every commit on the PR was signed by GitHub and authored by renovate[bot],
+        # or by github-actions[bot] for a fixup a repository's workflow makes to Renovate's commit (go.sum
+        # where Renovate cannot update it), and the last one is the head commit evaluated.
+        # A signature stays valid whoever pushes the commit, so a renovate[bot] commit from another PR, or
+        # from Renovate running on another repository, could be pushed here. Each renovate[bot] commit
+        # must therefore have a pull_request run that Renovate's own push of it started for this PR
+        # (renovate_pushed_runs): a push by anyone else starts its runs as them.
+        # Any workflow with a contents: write token can make a GitHub-signed commit authored by
+        # github-actions[bot], so each such commit must also be a recorded fixup: its only parent is the
+        # renovate[bot] commit before it on the PR, renovate_fixup_recorded finds the run that made it,
+        # and renovate_fixup_content finds it changes only what a go.sum fixup may.
+        # A pull_request run executes the workflows of its PR's base branch, and anyone with write access
+        # can open another PR from a Renovate branch into a branch of their own, or retarget this one, so
+        # that Renovate's next push runs their workflow. A run's pull_requests field is read when it is
+        # queried, not recorded when the run starts, so it does not show which PR started the run. A PR
+        # therefore passes only when no PR but Renovate's has ever used its branch, and its base has never
+        # changed: PRs cannot be deleted, and the base change stays on the timeline. headRefName also
+        # matches PRs from a fork's branch of the same name, whose runs Renovate's push does not start, so
+        # only PRs from this repository count.
+        renovate_commits_pass() {
+          local commits created commit fixup parent
+          commits=$(gh api graphql -f owner="${1%%/*}" -f name="${1#*/}" -F number="$2" -f branch="$4" -f query='
+            query($owner: String!, $name: String!, $number: Int!, $branch: String!) {
+              repository(owner: $owner, name: $name) {
+                pullRequests(headRefName: $branch, first: 100) { totalCount nodes { author { __typename login } headRepository { nameWithOwner } } }
+                pullRequest(number: $number) { createdAt
+                timelineItems(itemTypes: [BASE_REF_CHANGED_EVENT]) { filteredCount }
+                commits(last: 100) { totalCount nodes { commit { oid
+                  parents(first: 2) { totalCount nodes { oid } }
+                  authors(first: 10) { nodes { user { login } } }
+                  signature { isValid wasSignedByGitHub } } } } } } }') || { echo false; return; }
+          [[ $(jq -r --arg head "$3" --arg repo "$1" '
+            .data.repository.pullRequest.commits as $c
+            | ($c.totalCount > 0) and ($c.totalCount == ($c.nodes | length))
+              and ($c.nodes | all(.commit
+                | .signature.isValid == true and .signature.wasSignedByGitHub == true
+                  and (.authors.nodes | length > 0
+                    and all((.user.login // "") | IN("renovate[bot]", "github-actions[bot]")))))
+              and ([ range($c.nodes | length) ] | all(. as $i | $c.nodes[$i].commit
+                | if any(.authors.nodes[]; .user.login == "github-actions[bot]") then
+                    $i > 0 and .parents.totalCount == 1
+                    and .parents.nodes[0].oid == $c.nodes[$i - 1].commit.oid
+                    and ($c.nodes[$i - 1].commit.authors.nodes | all(.user.login == "renovate[bot]"))
+                  else true end))
+              and ($c.nodes[-1].commit.oid == $head)
+              and .data.repository.pullRequest.timelineItems.filteredCount == 0
+              and (.data.repository.pullRequests as $p | $p.totalCount == ($p.nodes | length)
+                and ($p.nodes | map(select((.headRepository.nameWithOwner // "" | ascii_downcase) == ($repo | ascii_downcase)))
+                  | all(.author.__typename == "Bot" and .author.login == "renovate")))
+          ' <<< "$commits" 2>/dev/null) == true ]] || { echo false; return; }
+          created=$(jq -r .data.repository.pullRequest.createdAt <<< "$commits")
+          while read -r commit; do
+            [[ -n $(renovate_pushed_runs "$1" "$2" "$4" "$5" "$created" "$commit") ]] || { echo false; return; }
+          done < <(jq -r '.data.repository.pullRequest.commits.nodes[].commit
+            | select(all(.authors.nodes[]; .user.login == "renovate[bot]")) | .oid' <<< "$commits")
+          while read -r fixup parent; do
+            [[ $(renovate_fixup_recorded "$1" "$2" "$4" "$5" "$created" "$fixup" "$parent") == true \
+              && $(renovate_fixup_content "$1" "$fixup" "$parent") == true ]] || { echo false; return; }
+          done < <(jq -r '.data.repository.pullRequest.commits.nodes[].commit
+            | select(any(.authors.nodes[]; .user.login == "github-actions[bot]"))
+            | "\(.oid) \(.parents.nodes[0].oid)"' <<< "$commits")
+          echo true
+        }
+        # Prints the pull_request runs that Renovate's own push of commit $6 started, from branch $3 of this
+        # repository into $4, for PR $2, created at $5: first attempts that renovate[bot] both started and
+        # triggered, since the PR was created. Renovate reuses a branch for the next PR once one merges, so
+        # a run from before the PR was Renovate's push for an earlier one. A commit from one of this PR's
+        # own earlier rebases still passes: it is Renovate's update for this PR. With the checks in
+        # renovate_commits_pass, those runs executed the workflows of base branch $4 merged with
+        # Renovate's commit, which are reviewed code.
+        renovate_pushed_runs() {
+          gh api "repos/$1/actions/runs?head_sha=$6&event=pull_request&per_page=100" |
+            jq -r --arg repo "$1" --arg branch "$3" --arg base "$4" --argjson number "$2" --arg created "$5" '
+              .workflow_runs[]
+              | select(.actor.login == "renovate[bot]" and .triggering_actor.login == "renovate[bot]"
+                  and .created_at >= $created
+                  and .run_attempt == 1 and .head_branch == $branch and .head_repository.full_name == $repo
+                  and (.pull_requests | length) == 1 and .pull_requests[0].number == $number
+                  and .pull_requests[0].base.ref == $base)
+              | .id'
+        }
+        # Prints true only when the fixup $6, made on $7, is recorded by one of renovate_pushed_runs for $7.
+        # The contract for a fixup workflow: after committing, upload an artifact named
+        # renovate-fixup-<commit oid>. Only the run itself can upload an artifact to it. A fixup without
+        # that record is recovered by ticking the rebase box on the PR, which has Renovate push a new
+        # commit; rerunning the workflow does not, as a rerun is not the first attempt and Renovate did
+        # not start it.
+        renovate_fixup_recorded() {
+          local id n
+          for id in $(renovate_pushed_runs "$1" "$2" "$3" "$4" "$5" "$7"); do
+            n=$(gh api "repos/$1/actions/runs/$id/artifacts?name=renovate-fixup-$6" \
+              --jq '[.artifacts[] | select(.expired | not)] | length') || n=0
+            (( n > 0 )) && { echo true; return; }
+          done
+          echo false
+        }
+        # Prints true only when the fixup $2 changes nothing but go.mod and go.sum, and keeps every go.mod
+        # directive of its parent $3 but require and go, the ones go mod tidy changes. A fixup cannot add
+        # a replace, exclude, retract, toolchain or godebug directive, or change the module path.
+        renovate_fixup_content() {
+          local files before after
+          files=$(gh api "repos/$1/commits/$2" --jq '[.files[].filename] | sort | join(" ")') || { echo false; return; }
+          [[ $files == "go.mod" || $files == "go.sum" || $files == "go.mod go.sum" ]] || { echo false; return; }
+          before=$(go_mod_directives "$1" "$3") && after=$(go_mod_directives "$1" "$2") \
+            && [[ $before == "$after" ]] && echo true || echo false
+        }
+        # A go.mod's directives at commit $2, one per line, all but require and go, comments dropped
+        go_mod_directives() {
+          local mod
+          mod=$(gh api -H "Accept: application/vnd.github.raw" "repos/$1/contents/go.mod?ref=$2") && [[ -n $mod ]] || return 1
+          sed 's|//.*||' <<< "$mod" | awk '
+            /^[[:space:]]*$/ { next }
+            /^[[:space:]]*\)/ { block = ""; next }
+            /^[a-z]+[[:space:]]*\([[:space:]]*$/ { block = $1; next }
+            { if (block != "") $0 = block " " $0; $1 = $1; if ($1 != "require" && $1 != "go") print }' | sort
+        }
+        repos="$SCAN_REPOS"
+        branch_owners=$(cat azure-pipelines/release-branch-owners.json)
         rm -rf failure_prs.log skip_prs.log
         rc=0
+        qualified_errors=false
           for repo in $repos $(EXTRA_REPOS); do
             echo ======== working for $repo ========
             echo $repo >> failure_prs.log
             merge_op=true
+            qualified_members_state=unloaded
             # if [[ $repo == "sonic-net/sonic-mgmt" ]]; then
             #   # For sonic-mgmt repo, it has its own github workflow to merge the cherry pick PR
             #   merge_op=false
             # fi
-            automerge_prs=$(gh pr list -A mssonicbld --label automerge -R $repo -L 100 --search "created:>=$date_1m_ago_q" --json body,title,url,labels,statusCheckRollup,createdAt,baseRefName,comments)
-            upgrade_versions_prs=$(gh pr list -A mssonicbld -R $repo -L 100 --search "(\"Upgrade SONiC package Versions\" OR \"Upgrade docker-sonic-mgmt package versions\" OR \"Upgrade docker-ptf package versions\") in:title created:>=$date_1m_ago_q" --json body,title,url,labels,statusCheckRollup,createdAt,baseRefName,comments)
-            prs=$(jq -sc 'add | unique_by(.url)' <(echo "$automerge_prs") <(echo "$upgrade_versions_prs"))
+            automerge_prs=$(gh pr list -A mssonicbld --label automerge -R $repo -L 100 --search "created:>=$date_1m_ago_q" --json body,title,url,labels,statusCheckRollup,createdAt,baseRefName,comments,autoMergeRequest,reviewDecision)
+            upgrade_versions_prs=$(gh pr list -A mssonicbld -R $repo -L 100 --search "(\"Upgrade SONiC package Versions\" OR \"Upgrade docker-sonic-mgmt package versions\" OR \"Upgrade docker-ptf package versions\") in:title created:>=$date_1m_ago_q" --json body,title,url,labels,statusCheckRollup,createdAt,baseRefName,comments,autoMergeRequest,reviewDecision)
+            # Renovate labels a security update automerge only when it is not a major bump. Listed at any age:
+            # a security update can stay open past a month while a blocker is fixed, and still has to merge
+            renovate_prs=$(gh pr list -A app/renovate --label automerge --label security -R $repo -L 100 --json author,body,title,url,labels,statusCheckRollup,createdAt,baseRefName,comments,headRefOid,headRefName,autoMergeRequest,reviewDecision)
+            qualified_approval_prs=$(gh pr list --label Qualified-approval -R $repo -L 100 --search "updated:>=$date_1m_ago_q" --json author,body,title,url,labels,statusCheckRollup,createdAt,baseRefName,comments,headRefOid,headRefName,isDraft)
+            prs=$(jq -sc 'add | unique_by(.url)' <(echo "$automerge_prs") <(echo "$upgrade_versions_prs") <(echo "$renovate_prs") <(echo "$qualified_approval_prs"))
             c=$(echo $prs | jq length)
             for ((i=0; i<$c; i++)); do
               set +x
               pr=$(echo $prs | jq .[$i])
               echo $pr | jq [.url,.author.login,.labels[].name]
               url=$(echo $pr | jq .url -r)
+              if echo "$qualified_approval_prs" | jq -e --arg url "$url" 'any(.url == $url and .isDraft == true)' > /dev/null; then
+                echo "Skipping $url: Qualified-approval PR is a draft." >> skip_prs.log
+                continue
+              fi
               body=$(echo $pr | jq .body -r)
               title=$(echo $pr | jq .title -r)
-              if echo "$title" | grep -Fqi -e "Upgrade SONiC package Versions" -e "Upgrade docker-sonic-mgmt package versions" -e "Upgrade docker-ptf package versions" && ! echo $pr | jq -e '.labels[]? | select(.name == "automerge")' > /dev/null; then
+              if echo "$pr" | jq -e '.autoMergeRequest != null and .reviewDecision == "REVIEW_REQUIRED"' > /dev/null; then
+                approval_reminder="@${repo}-maintainer, auto-merge is enabled for this PR, but GitHub still requires an approval from an account with write permission. Please help review and provide the required approval."
+                comment_pr_if_new "$pr" "$url" "$approval_reminder"
+              fi
+              qualified_approval=false
+              if echo "$qualified_approval_prs" | jq -e --arg url "$url" 'any(.url == $url)' > /dev/null; then
+                qualified_approval=true
+                qualified_head=$(echo "$qualified_approval_prs" | jq -r --arg url "$url" '.[] | select(.url == $url) | .headRefOid')
+                risk=$(echo "$pr" | jq -r '
+                  [.labels[].name | ascii_downcase] as $labels
+                  | ["high", "medium", "low"]
+                  | map(select(. + " merge risk" | IN($labels[])))
+                  | .[0] // "missing"')
+                notification=''
+                notification_key=''
+                case "$risk" in
+                  high)
+                    notification="@${repo}-maintainer, this Qualified-approval PR has high merge risk and will not be automatically merged. Please review and merge manually."
+                    ;;
+                  medium)
+                    if [[ "$qualified_members_state" == unloaded ]]; then
+                      qualified_members_state=failed
+                      if ! maintainers=$(gh api --paginate --slurp "orgs/${repo%%/*}/teams/${repo#*/}-maintainer/members?per_page=100"); then
+                        echo "Failed to fetch maintainer team members for $url" >> failure_prs.log
+                        qualified_errors=true
+                        continue
+                      fi
+                      if ! admins=$(gh api --paginate --slurp "repos/$repo/collaborators?permission=admin&per_page=100"); then
+                        echo "Failed to fetch repository admins for $url" >> failure_prs.log
+                        qualified_errors=true
+                        continue
+                      fi
+                      if ! admin_users=$(echo "$admins" | jq -c '
+                        add // [] | map(select(.permissions.admin == true) | .login | ascii_downcase) | unique
+                      '); then
+                        echo "Failed to evaluate repository admins for $url" >> failure_prs.log
+                        qualified_errors=true
+                        continue
+                      fi
+                      if ! qualified_members=$(echo "$maintainers" | jq -c --argjson admins "$admin_users" '
+                        (add // [] | map(.login | ascii_downcase)) + $admins | unique
+                      '); then
+                        echo "Failed to evaluate maintainer team members for $url" >> failure_prs.log
+                        qualified_errors=true
+                        continue
+                      fi
+                      if ! admin_mentions=$(echo "$admin_users" | jq -r --argjson excluded "$EXCLUDED_ADMIN_MENTIONS" '
+                        ($excluded | map(ascii_downcase)) as $excluded_users
+                        | map(select(. as $user | $excluded_users | index($user) == null))
+                        | map("@" + .) | join(", ")
+                      '); then
+                        echo "Failed to format repository admin mentions for $url" >> failure_prs.log
+                        qualified_errors=true
+                        continue
+                      fi
+                      qualified_members_state=ready
+                    fi
+                    if [[ "$qualified_members_state" == failed ]]; then
+                      echo "Skipping $url: maintainer or admin lookup failed for $repo in this scan" >> failure_prs.log
+                      qualified_errors=true
+                      continue
+                    fi
+                    if ! reviews=$(gh api --paginate --slurp "repos/$repo/pulls/${url##*/}/reviews?per_page=100"); then
+                      echo "Failed to fetch reviews for $url" >> failure_prs.log
+                      qualified_errors=true
+                      continue
+                    fi
+                    if ! approved=$(echo "$reviews" | jq -r --argjson members "$qualified_members" --arg head "$qualified_head" '
+                      add // [] | map(select(.state != "COMMENTED" and .state != "PENDING"))
+                      | group_by(.user.login | ascii_downcase)
+                      | map(max_by(.id))
+                      | any(.state == "APPROVED" and .commit_id == $head
+                        and (.user.login | ascii_downcase | IN($members[])))
+                    '); then
+                      echo "Failed to evaluate maintainer and admin reviews for $url" >> failure_prs.log
+                      qualified_errors=true
+                      continue
+                    fi
+                    if [[ "$approved" != true ]]; then
+                      notification="@${repo}-maintainer${admin_mentions:+, $admin_mentions}, this Qualified-approval PR has medium merge risk. Please help approve the current head commit to allow automatic merging."
+                      notification_key="@${repo}-maintainer, this Qualified-approval PR has medium merge risk. Please help approve the current head commit to allow automatic merging."
+                    fi
+                    ;;
+                  low) ;;
+                  *)
+                    if ! label_events=$(gh api --paginate --slurp "repos/$repo/issues/${url##*/}/events?per_page=100"); then
+                      echo "Failed to fetch label events for $url" >> failure_prs.log
+                      qualified_errors=true
+                      continue
+                    fi
+                    if ! qualified_labeled_at=$(echo "$label_events" | jq -r '
+                      add | [.[] | select(.event == "labeled" and .label.name == "Qualified-approval") | .created_at]
+                      | max // empty
+                    '); then
+                      echo "Failed to evaluate Qualified-approval label events for $url" >> failure_prs.log
+                      qualified_errors=true
+                      continue
+                    fi
+                    if [[ -z "$qualified_labeled_at" ]]; then
+                      echo "Cannot determine when Qualified-approval was added for $url" >> failure_prs.log
+                      qualified_errors=true
+                      continue
+                    fi
+                    if [[ "$qualified_labeled_at" > "$date_3h_ago" ]]; then
+                      echo "Skipping $url: no merge risk label; Qualified-approval was added less than 3 hours ago." >> skip_prs.log
+                      continue
+                    fi
+                    notification="@yijingyan2, this Qualified-approval PR has no merge risk label. Please help check."
+                    ;;
+                esac
+                if [[ -n "$notification" ]]; then
+                  comment_pr_if_new "$pr" "$url" "$notification" "$notification_key"
+                  echo "Skipping $url: $notification" >> skip_prs.log
+                  continue
+                fi
+              fi
+              if { echo "$title" | grep -Fqi -e "Upgrade SONiC package Versions" -e "Upgrade docker-sonic-mgmt package versions" -e "Upgrade docker-ptf package versions" || echo "$pr" | jq -e '.labels[]? | select(.name == "Qualified-approval")' > /dev/null; } && ! echo "$pr" | jq -e '.labels[]? | select(.name == "automerge")' > /dev/null; then
                 gh pr edit $url -R $repo --add-label automerge
               fi
               origin_pr_url=$(echo $pr | jq .comments[].body -r | grep '^Original PR: ' | grep -Eo "https://github.com/.*/pull/[0-9]*" | head -n1 || true)
@@ -114,10 +420,33 @@ jobs:
                   continue
                 fi
               done
+              renovate=false
+              merge_head=''
+              if $qualified_approval; then
+                merge_head="--match-head-commit $qualified_head"
+              fi
+              if [[ $(echo $pr | jq -r '.author.login // ""') == "app/renovate" ]]; then
+                renovate=true
+                required=$(gh api "repos/$repo/branches/$(echo $pr | jq -r .baseRefName)" --jq '.protection.required_status_checks.contexts // []' || echo null)
+                commits_pass=$(renovate_commits_pass "$repo" "${url##*/}" "$(echo $pr | jq -r .headRefOid)" \
+                  "$(echo $pr | jq -r .headRefName)" "$(echo $pr | jq -r .baseRefName)")
+                approved=false
+                [[ $commits_pass == true ]] && approved=$(renovate_approve_runs "$repo" "$(echo $pr | jq -r .headRefOid)" \
+                  "$(echo $pr | jq -r .headRefName)" "$url")
+                pr_success=false
+                [[ $required != null && $(renovate_checks_pass "$checks" "$required") == true \
+                  && $commits_pass == true && $approved == false ]] && pr_success=true
+                # Merge only the commit whose checks were evaluated
+                merge_head="--match-head-commit $(echo $pr | jq -r .headRefOid)"
+              fi
               # If auto cherry pick PRs failed
               if ! $pr_success; then
                 echo "    $url" >> skip_prs.log
                 echo $pr | jq '.statusCheckRollup[] | "        "+.status+" "+.conclusion+"  "+.name' -r >> skip_prs.log
+                # A Renovate PR that fails waits for its reviewers; the cherry pick retry and escalation below do not apply
+                if $renovate; then
+                  continue
+                fi
                 comments_in_prs=$(echo $pr | jq .comments)
                 retried=false
                 if echo "$comments_in_prs" | jq -e '.[]? | select(((.author.login // "") == "mssonicbld") and ((.body // "") | test("^/azpw retry(\\s|$)"; "i")))' > /dev/null; then
@@ -134,7 +463,7 @@ jobs:
                   author=$(echo $origin_pr_detail | jq .author.login -r)
                   origin_comments=$(echo $origin_pr_detail | jq .comments)
                   release_owner_key=$(echo "$base_ref" | sed -E 's/^msft-//' | grep -Eo '[0-9]{6}' | head -n1 || true)
-                  release_owner=$(echo "$release_owners" | jq -r --arg release_owner_key "$release_owner_key" '.[$release_owner_key] // empty')
+                  release_owner=$(echo "$branch_owners" | jq -r --arg release_owner_key "$release_owner_key" '.[$release_owner_key].githubAccount // empty')
                   if ! echo "$origin_comments" | jq -e '.[]? | select(((.author.login // "") == "mssonicbld") and ((.body // "") | test("cherry pick PR didn.t pass PR checker after retry"; "i")))' > /dev/null; then
                     [[ $created_at > $date_15d_ago ]] && comment_pr "$origin_pr_url" "@$author cherry pick PR didn't pass PR checker after retry. Please help check! Thanks.<br>$url"
                     [[ $created_at > $date_15d_ago ]] && comment_pr "$url" "@$release_owner The cherry pick PR didn't pass PR checker after retry. Left a comment in original PR $origin_pr_url to notify author."
@@ -156,8 +485,25 @@ jobs:
                 opt="--merge"
               fi
               echo "    $url"  >> failure_prs.log
-              if output=$(gh pr merge $opt --admin -R $repo $url -b "$body" 2>&1); then
-                [ -n "$origin_pr_url" ] && gh pr edit $origin_pr_url -R $repo --add-label "Included in $base_ref Branch" --remove-label "Created PR to $base_ref Branch,Cherry Pick Conflict_$base_ref"
+              if queue_required=$(gh api graphql -f owner="${repo%%/*}" -f name="${repo#*/}" -F number="${url##*/}" -f query='
+                query($owner: String!, $name: String!, $number: Int!) {
+                  repository(owner: $owner, name: $name) {
+                    pullRequest(number: $number) { isMergeQueueEnabled }
+                  }
+                }' --jq '.data.repository.pullRequest.isMergeQueueEnabled' 2>&1) && [[ "$queue_required" == true || "$queue_required" == false ]]; then
+                merge_flags=(--admin)
+                if [[ "$queue_required" == true ]]; then
+                  merge_flags=()
+                fi
+              else
+                echo "        Failed to determine merge queue requirement: $queue_required" >> failure_prs.log
+                (( ++rc ))
+                continue
+              fi
+              if output=$(gh pr merge $opt "${merge_flags[@]}" $merge_head -R $repo $url -b "$body" 2>&1); then
+                if [[ "$queue_required" == false && -n "$origin_pr_url" ]]; then
+                  gh pr edit $origin_pr_url -R $repo --add-label "Included in $base_ref Branch" --remove-label "Created PR to $base_ref Branch,Cherry Pick Conflict_$base_ref"
+                fi
               else
                 (( ++rc ))
               fi
@@ -165,9 +511,13 @@ jobs:
               echo ========Finished PR========
             done
           done
+        if $qualified_errors; then exit 1; fi
         if (( rc >= 10 )); then exit $rc; fi
         exit 0
       displayName: cherry pick scanning
+      env:
+        SCAN_REPOS: ${{ parameters.repos }}
+        EXCLUDED_ADMIN_MENTIONS: $(excludedAdminMentions)
     - script: |
         set -ex
         [ -f skip_prs.log ] && cat skip_prs.log
@@ -186,8 +536,8 @@ jobs:
           local full_body=$(printf "%s\n\n%s" "$comment_body" "$comment_watermark")
           gh pr comment "$pr_url" --body "$full_body"
         }
-        repos="${{ parameters.repos }}"
-        release_owners=$(cat azure-pipelines/release-owners_github_account.json)
+        repos="$SCAN_REPOS"
+        branch_owners=$(cat azure-pipelines/release-branch-owners.json)
         for repo in $repos $(EXTRA_REPOS); do
           echo ======== working for $repo ========
           echo "=======Results for $repo======" >> label_scan.log
@@ -263,7 +613,7 @@ jobs:
               if ! echo "$comments" | jq -e '.[]? | select(((.author.login // "") == "mssonicbld") and ((.body // "") | test("please manually create the cherry pick PR"; "i")))' > /dev/null; then
                 if ! echo "$comments" | jq -e --arg base_branch "$base_branch" '.[]? | select(((.author.login // "") != "mssonicbld") and ((.body // "") | test("already in " + $base_branch; "i")))' > /dev/null; then
                   release_owner_key=$(echo "$base_branch" | sed -E 's/^msft-//' | grep -Eo '[0-9]{6}' | head -n1 || true)
-                  release_owner=$(echo "$release_owners" | jq -r --arg release_owner_key "$release_owner_key" '.[$release_owner_key] // empty')
+                  release_owner=$(echo "$branch_owners" | jq -r --arg release_owner_key "$release_owner_key" '.[$release_owner_key].githubAccount // empty')
                   comment_pr "$url" "The change is not in $base_branch yet. @$author, please manually create the cherry pick PR for branch $base_branch.<br>You can ping the release branch owner(github account: $release_owner) to approve your cherry pick PR.<br>If this change is already in $base_branch, please comment \"already in $base_branch\". Thanks!"
                   echo "Commented to let author manually create cherry pick PR and ask release owner for approval for $url" >> label_scan.log
                 fi
@@ -274,6 +624,8 @@ jobs:
           echo "===============" >> label_scan.log
         done
       displayName: label scanning
+      env:
+        SCAN_REPOS: ${{ parameters.repos }}
     - script: |
         set -ex
         [ -f label_scan.log ] && cat label_scan.log

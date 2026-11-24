@@ -7,9 +7,58 @@ DEFAULT_ARCH=$(dpkg --print-architecture)
 [ -z "$ARCH" ] && [ -f /etc/docker-arch ] && ARCH=$(cat /etc/docker-arch)
 [ -z "$ARCH" ] && ARCH=$DEFAULT_ARCH  
 
+# Avoid slow Azure Ubuntu mirror downloads on amd64 hosts.
+if [ "$DEFAULT_ARCH" == "amd64" ]; then
+  for source in /etc/apt/sources.list \
+                /etc/apt/sources.list.d/*.list \
+                /etc/apt/sources.list.d/*.sources; do
+    if [ -f "$source" ]; then
+      sed -i \
+        's|://azure\.archive\.ubuntu\.com/ubuntu|://archive.ubuntu.com/ubuntu|g' \
+        "$source"
+    fi
+  done
+fi
+
 dpkg --configure -a
 apt-get update
+DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a \
+  apt-get upgrade -y --with-new-pkgs \
+  -o Dpkg::Options::="--force-confdef" \
+  -o Dpkg::Options::="--force-confold"
 apt-get install -y ca-certificates curl gnupg lsb-release
+
+# Install the Bazel builder profile
+apt-get install -y apparmor
+if [ "$(cat /sys/module/apparmor/parameters/enabled)" != Y ]; then
+  echo "ERROR: AppArmor must be enabled to install the Bazel builder profile." >&2
+  exit 1
+fi
+if [ ! -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+  echo "ERROR: Agent kernel does not expose AppArmor user namespace mediation." >&2
+  exit 1
+fi
+mkdir -p /etc/apparmor.d
+cat > /etc/apparmor.d/sonic-bazel-builder <<'EOF'
+abi <abi/4.0>,
+include <tunables/global>
+
+# Explicitly selected by Docker, not attached to arbitrary executable paths.
+# Preserve the builder's existing unconfined access, with userns permission.
+profile sonic-bazel-builder flags=(default_allow) {
+    userns,
+}
+EOF
+if ! apparmor_parser -r -T /etc/apparmor.d/sonic-bazel-builder; then
+  echo "ERROR: Cannot load the sonic-bazel-builder AppArmor profile." >&2
+  exit 1
+fi
+if ! grep -q '^sonic-bazel-builder ' /sys/kernel/security/apparmor/profiles; then
+  echo "ERROR: sonic-bazel-builder is missing from the loaded AppArmor profiles." >&2
+  exit 1
+fi
+echo "Installed sonic-bazel-builder; select it with --security-opt apparmor=sonic-bazel-builder."
+
 # install git lfs
 curl -s https://packagecloud.io/install/repositories/github/git-lfs/script.deb.sh | bash
 apt-get install -y git-lfs acl
@@ -27,7 +76,7 @@ apt-get update
 #apt-get install -y docker-ce:$ARCH docker-ce-cli:$ARCH containerd.io:$ARCH docker-compose-plugin:$ARCH
 # docker-ce 29 docker root don't work.
 # containerd 2.2.1 can't download, pin to 2.2.0
-apt-get install -y docker-ce=5:28.5.2-1~ubuntu.24.04~noble docker-ce-cli=5:28.5.2-1~ubuntu.24.04~noble containerd.io=2.2.0-2~ubuntu.24.04~noble docker-compose-plugin:$ARCH
+apt-get install -y --allow-downgrades docker-ce=5:28.5.2-1~ubuntu.24.04~noble docker-ce-cli=5:28.5.2-1~ubuntu.24.04~noble containerd.io=2.2.0-2~ubuntu.24.04~noble docker-compose-plugin:$ARCH
 
 if [ "$ARCH" == "amd64" ]; then
   # On amd64, reduce the number of random bits for ASLR to 28 from 32. This was
@@ -82,18 +131,18 @@ dpkg -i packages-microsoft-prod.deb
 rm packages-microsoft-prod.deb
 apt-get update
 echo "intnfs.file.core.windows.net:/intnfs/nfs /nfs aznfs noauto,x-systemd.automount,_netdev,vers=4.1,sec=sys,nconnect=4 0 0" >> /etc/fstab
-apt-get install -y build-essential aznfs nfs-common python3-pip python3-setuptools python3-pip python-is-python3
+apt-get install -y build-essential aznfs nfs-common python3-setuptools python-is-python3
 # Some job need pwsh, Job Validation/Release Task Validation
 if [ "$ARCH" == "amd64" ]; then
   apt-get install -y powershell
 else
   mkdir -p /opt/microsoft/powershell/7
-  wget https://github.com/PowerShell/PowerShell/releases/download/v7.5.4/powershell-7.5.4-linux-arm64.tar.gz
-  tar -xzf powershell-7.5.4-linux-arm64.tar.gz -C /opt/microsoft/powershell/7
+  wget https://github.com/PowerShell/PowerShell/releases/download/v7.5.10/powershell-7.5.10-linux-arm64.tar.gz
+  tar -xzf powershell-7.5.10-linux-arm64.tar.gz -C /opt/microsoft/powershell/7
   ln -s /opt/microsoft/powershell/7/pwsh /usr/bin/pwsh
   chmod +x /opt/microsoft/powershell/7/pwsh
   pwsh -v
 fi
-pip3 install jinjanator --break-system-packages
+curl -LsSf https://astral.sh/uv/0.13.0/install.sh | env UV_UNMANAGED_INSTALL=/usr/local/bin sh
+UV_TOOL_DIR=/opt/uv/tools UV_TOOL_BIN_DIR=/usr/local/bin uv tool install jinjanator
 mkdir -p /nfs
-
